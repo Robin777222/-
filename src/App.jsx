@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   RotateCcw, Trophy, Clock, Layers, Bot, Globe, Users, KeyRound,
   UserCircle, Copy, ArrowRight, Loader2, Check, PlusCircle, ShieldCheck, X,
-  Mail, Gamepad2, LifeBuoy, Gavel, AlertTriangle, Ban, Settings2
+  Mail, Gamepad2, LifeBuoy, Gavel, AlertTriangle, Ban, Settings2, PlayCircle, PauseCircle
 } from 'lucide-react';
 
 const WORDS = [
@@ -284,6 +284,18 @@ function makeCode() {
   return c;
 }
 function makeId() { return Math.random().toString(36).slice(2, 10); }
+function getOrCreateDeviceId() {
+  try {
+    let id = window.localStorage.getItem('faseeh_device_id');
+    if (!id) {
+      id = makeId();
+      window.localStorage.setItem('faseeh_device_id', id);
+    }
+    return id;
+  } catch (e) {
+    return makeId();
+  }
+}
 
 const woodBgStyle = {
   backgroundColor: '#2b1810',
@@ -404,7 +416,11 @@ export default function App() {
   }, []);
 
   const cairo = { fontFamily: "'Cairo', sans-serif" };
-  const myIdRef = useRef(makeId());
+  const myIdRef = useRef(getOrCreateDeviceId());
+  const knownDealIdRef = useRef(null);
+  const knownCurrentPlayerIdRef = useRef(null);
+  const knownPendingIdRef = useRef(null);
+  const knownPausedRef = useRef(false);
 
   const [screen, setScreen] = useState('menu');
   const [pendingDestination, setPendingDestination] = useState(null);
@@ -478,7 +494,8 @@ export default function App() {
   const [gameStartsAt, setGameStartsAt] = useState(0);
   const [prepTimeLeft, setPrepTimeLeft] = useState(0);
   const [timeLeft, setTimeLeft] = useState(0);
-  const [pendingMove, setPendingMove] = useState(null); // { moverIndex, pos, letter, isStar, candidateWord, deadline, disputed }
+  const [pendingMove, setPendingMove] = useState(null); // { moverIndex, pos, letter, isStar, candidateWord, deadline, disputed, id }
+  const [paused, setPaused] = useState(false);
   const [objectionTimeLeft, setObjectionTimeLeft] = useState(0);
 
   const statedRef = useRef(false); // guards double stat-writes on finish
@@ -514,6 +531,30 @@ export default function App() {
     })();
     loadApprovedWords();
     loadMinRoundsConfig();
+
+    // Reconnect after an accidental refresh mid-session, if we were in one.
+    (async () => {
+      try {
+        const savedCode = window.localStorage.getItem('faseeh_current_session');
+        if (!savedCode) return;
+        const session = await readSession(savedCode);
+        if (!session || !session.players.some((p) => p.id === myIdRef.current)) {
+          window.localStorage.removeItem('faseeh_current_session');
+          return;
+        }
+        setSessionCode(savedCode);
+        setAmHost(session.players[0].id === myIdRef.current);
+        setMode('online');
+        if (session.status === 'waiting') {
+          setWaitingPlayers(session.players);
+          setMaxPlayers(session.maxPlayers || 2);
+          setSearchMsg(session.players[0].id === myIdRef.current ? 'بانتظار انضمام اللاعبين...' : 'بانتظار بدء اللاعب المضيف...');
+          setScreen('session-wait');
+        } else {
+          applySessionToLocal(session);
+        }
+      } catch (e) { /* best effort */ }
+    })();
   }, []);
 
   async function loadApprovedWords() {
@@ -760,10 +801,15 @@ export default function App() {
     const hands = {};
     session.players.forEach((p) => { hands[p.id] = dealHandWithStars(newBag, sStartCards); });
     const startWord = WORDS[Math.floor(Math.random() * WORDS.length)].split('');
+    // NOTE: gameStartsAt/turnEndsAt below are only a fallback for the very
+    // first read; every client re-anchors these using its OWN clock the
+    // moment it observes a new dealId (see applySessionToLocal), so clock
+    // differences between devices never cause mismatched countdowns.
     const startsAt = Date.now() + PREP_SECONDS * 1000;
     return {
       code,
       status: 'playing',
+      dealId: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       turnSeconds: sTurnSeconds,
       startCards: sStartCards,
       communityMode: !!session.communityMode,
@@ -782,26 +828,76 @@ export default function App() {
       lastMessageType: 'info',
       winnerId: null,
       pendingMove: null,
+      paused: false,
+      pausedRemaining: null,
+      pausedType: null,
     };
   }
 
   function applySessionToLocal(session) {
     const sPlayers = session.players;
+    const sTurnSeconds = session.turnSeconds || 10;
     setPlayers(sPlayers.map((p) => ({ id: p.id, name: p.name, hand: session.hands[p.id] || [] })));
     setMyIndex(Math.max(0, sPlayers.findIndex((p) => p.id === myIdRef.current)));
     setBag(session.bag);
     setTableWord(session.tableWord);
     setTableStarFlags(session.tableStarFlags || session.tableWord.map(() => false));
     setCurrentIdx(Math.max(0, sPlayers.findIndex((p) => p.id === session.currentPlayerId)));
-    setGameStartsAt(session.gameStartsAt || 0);
-    setTurnEndsAt(session.turnEndsAt);
     setMessage(session.lastMessage || '');
     setMessageType(session.lastMessageType || 'info');
     setCommunityMode(!!session.communityMode);
     setObjectionSeconds(session.objectionSeconds || 5);
     setMaxPlayers(session.maxPlayers || 2);
     setExcludedLetters(session.excludedLetters || []);
-    setPendingMove(session.pendingMove || null);
+
+    // ---- clock-skew-proof local anchoring ----
+    // Different devices' clocks are never trusted to agree. Instead, each
+    // client anchors its OWN countdown using ITS OWN Date.now() the first
+    // moment it observes something new (a fresh deal, a new turn, a new
+    // pending move, or a resume-from-pause) - never touching it again until
+    // the next such change. This is what makes every player's timer show
+    // the correct duration regardless of another device's wall clock.
+    if (session.dealId !== knownDealIdRef.current) {
+      knownDealIdRef.current = session.dealId;
+      knownCurrentPlayerIdRef.current = session.currentPlayerId;
+      const startsAt = Date.now() + PREP_SECONDS * 1000;
+      setGameStartsAt(startsAt);
+      setTurnEndsAt(startsAt + sTurnSeconds * 1000);
+    } else if (session.currentPlayerId !== knownCurrentPlayerIdRef.current) {
+      knownCurrentPlayerIdRef.current = session.currentPlayerId;
+      setGameStartsAt(0);
+      setTurnEndsAt(Date.now() + sTurnSeconds * 1000);
+    }
+
+    if (session.pendingMove) {
+      const pmId = session.pendingMove.id;
+      if (pmId !== knownPendingIdRef.current) {
+        knownPendingIdRef.current = pmId;
+        setPendingMove({ ...session.pendingMove, deadline: Date.now() + (session.objectionSeconds || 5) * 1000 });
+      } else {
+        // Same pending move as before (e.g. someone just disputed it) - keep
+        // our own already-anchored deadline, just refresh the other fields.
+        setPendingMove((prev) => (prev ? { ...session.pendingMove, deadline: prev.deadline } : { ...session.pendingMove, deadline: Date.now() + (session.objectionSeconds || 5) * 1000 }));
+      }
+    } else {
+      knownPendingIdRef.current = null;
+      setPendingMove(null);
+    }
+
+    if (session.paused && !knownPausedRef.current) {
+      // just paused - ticking effects freeze on their own via the `paused` flag
+    } else if (!session.paused && knownPausedRef.current) {
+      // just resumed - reanchor from the remaining time using OUR clock
+      const remaining = session.pausedRemaining || sTurnSeconds;
+      if (session.pausedType === 'objection') {
+        setPendingMove((prev) => (prev ? { ...prev, deadline: Date.now() + remaining * 1000 } : prev));
+      } else {
+        setTurnEndsAt(Date.now() + remaining * 1000);
+      }
+    }
+    knownPausedRef.current = !!session.paused;
+    setPaused(!!session.paused);
+
     if (session.winnerId) {
       setWinnerIdx(Math.max(0, sPlayers.findIndex((p) => p.id === session.winnerId)));
       setScreen('finished');
@@ -821,6 +917,7 @@ export default function App() {
       turnEndsAt: 0, lastMessage: '', winnerId: null, pendingMove: null,
     });
     setSessionCode(code);
+    try { window.localStorage.setItem('faseeh_current_session', code); } catch (e) {}
     setAmHost(true);
     setMode('online');
     setWaitingPlayers([me]);
@@ -891,6 +988,7 @@ export default function App() {
     const lobby = await readLobby();
     await writeLobby([...lobby.filter((e) => e.code !== code), { code, createdAt: Date.now() }]);
     setSessionCode(code);
+    try { window.localStorage.setItem('faseeh_current_session', code); } catch (e) {}
     setAmHost(true);
     setWaitingPlayers([me]);
     setSearchMsg('جاري البحث عن لاعب...');
@@ -915,6 +1013,7 @@ export default function App() {
     const updated = { ...session, players: [...session.players, me] };
     await writeSession(code, updated);
     setSessionCode(code);
+    try { window.localStorage.setItem('faseeh_current_session', code); } catch (e) {}
     setAmHost(false);
     setMode('online');
     setMaxPlayers(cap);
@@ -966,9 +1065,9 @@ export default function App() {
     return () => clearInterval(interval);
   }, [screen]);
 
-  // ---- polling during play (online) to receive opponent moves ----
+  // ---- polling during play/finished (online) to receive opponent moves or a rematch ----
   useEffect(() => {
-    if (screen !== 'playing' || modeRef.current !== 'online') return;
+    if ((screen !== 'playing' && screen !== 'finished') || modeRef.current !== 'online') return;
     const interval = setInterval(async () => {
       const code = sessionCodeRef.current;
       if (!code) return;
@@ -1006,6 +1105,32 @@ export default function App() {
     setScreen('playing');
   }
 
+  // ---- grab attention the instant it becomes this player's turn ----
+  const myTurnAttentionRef = useRef(false);
+  const titleFlashIntervalRef = useRef(null);
+  useEffect(() => {
+    const isMyTurn = screen === 'playing' && !paused && prepTimeLeft === 0 && !pendingMove && mode && currentIdx === myIndex;
+    if (isMyTurn && !myTurnAttentionRef.current) {
+      try { if (navigator.vibrate) navigator.vibrate([200, 100, 200]); } catch (e) { /* not supported */ }
+      const original = document.title;
+      let on = false;
+      if (titleFlashIntervalRef.current) clearInterval(titleFlashIntervalRef.current);
+      titleFlashIntervalRef.current = setInterval(() => {
+        document.title = on ? original : '🔔 دورك الآن!';
+        on = !on;
+      }, 900);
+    } else if (!isMyTurn && myTurnAttentionRef.current && titleFlashIntervalRef.current) {
+      clearInterval(titleFlashIntervalRef.current);
+      titleFlashIntervalRef.current = null;
+      document.title = 'فصيح';
+    }
+    myTurnAttentionRef.current = isMyTurn;
+  }, [screen, paused, prepTimeLeft, pendingMove, currentIdx, myIndex, mode]);
+
+  useEffect(() => {
+    return () => { if (titleFlashIntervalRef.current) clearInterval(titleFlashIntervalRef.current); };
+  }, []);
+
   // ---- pre-game "get ready" countdown ----
   useEffect(() => {
     if (screen !== 'playing' || !gameStartsAt) { setPrepTimeLeft(0); return; }
@@ -1015,43 +1140,43 @@ export default function App() {
     return () => clearInterval(t);
   }, [screen, gameStartsAt]);
 
-  // ---- local ticking countdown display (frozen while a move is under discussion or still in prep) ----
+  // ---- local ticking countdown display (frozen while a move is under discussion, still in prep, or paused) ----
   useEffect(() => {
-    if (screen !== 'playing' || pendingMove || prepTimeLeft > 0) return;
+    if (screen !== 'playing' || pendingMove || prepTimeLeft > 0 || paused) return;
     const t = setInterval(() => {
       setTimeLeft(Math.max(0, Math.ceil((turnEndsAt - Date.now()) / 1000)));
     }, 250);
     return () => clearInterval(t);
-  }, [screen, turnEndsAt, pendingMove, prepTimeLeft]);
+  }, [screen, turnEndsAt, pendingMove, prepTimeLeft, paused]);
 
-  // ---- timeout handling (only the player whose turn it is triggers it; never while a move is pending or still in prep) ----
+  // ---- timeout handling (only the player whose turn it is triggers it; never while a move is pending, in prep, or paused) ----
   useEffect(() => {
-    if (screen !== 'playing' || winnerIdx !== null || pendingMove || prepTimeLeft > 0) return;
+    if (screen !== 'playing' || winnerIdx !== null || pendingMove || prepTimeLeft > 0 || paused) return;
     if (currentIdxRef.current !== myIndexRef.current) return;
     if (timeLeft > 0) return;
     applyPenaltyAndAdvance('انتهى الوقت');
-  }, [timeLeft, screen, winnerIdx, pendingMove, prepTimeLeft]);
+  }, [timeLeft, screen, winnerIdx, pendingMove, prepTimeLeft, paused]);
 
   // ---- objection countdown display ----
   useEffect(() => {
-    if (screen !== 'playing' || !pendingMove || pendingMove.disputed) { setObjectionTimeLeft(0); return; }
+    if (screen !== 'playing' || !pendingMove || pendingMove.disputed || paused) { if (!paused) setObjectionTimeLeft(0); return; }
     const tick = () => setObjectionTimeLeft(Math.max(0, Math.ceil((pendingMove.deadline - Date.now()) / 1000)));
     tick();
     const t = setInterval(tick, 250);
     return () => clearInterval(t);
-  }, [screen, pendingMove]);
+  }, [screen, pendingMove, paused]);
 
   // ---- auto-accept once the objection window passes with no objection (mover's own client confirms) ----
   useEffect(() => {
-    if (screen !== 'playing' || !pendingMove || pendingMove.disputed) return;
+    if (screen !== 'playing' || !pendingMove || pendingMove.disputed || paused) return;
     if (objectionTimeLeft > 0) return;
     if (pendingMove.moverIndex !== myIndexRef.current) return;
     resolvePendingMove('accept');
-  }, [objectionTimeLeft, pendingMove, screen]);
+  }, [objectionTimeLeft, pendingMove, screen, paused]);
 
   // ---- bot AI turn ----
   useEffect(() => {
-    if (screen !== 'playing' || mode !== 'bot' || winnerIdx !== null || prepTimeLeft > 0) return;
+    if (screen !== 'playing' || mode !== 'bot' || winnerIdx !== null || prepTimeLeft > 0 || paused) return;
     if (currentIdx !== 1) return;
     const botTimer = setTimeout(() => {
       try {
@@ -1148,6 +1273,10 @@ export default function App() {
     setMessageType('error');
     setCurrentIdx(nextIdx);
     setTurnEndsAt(newTurnEndsAt);
+    if (modeRef.current === 'online') {
+      knownCurrentPlayerIdRef.current = newPlayers[nextIdx].id;
+      knownPendingIdRef.current = null;
+    }
     if (modeRef.current === 'bot' && idx === 1) setRoundNumber((r) => r + 1);
 
     if (modeRef.current === 'online') {
@@ -1181,6 +1310,7 @@ export default function App() {
 
     setSelectedHand(null);
     setPendingMove(null);
+    if (modeRef.current === 'online') knownPendingIdRef.current = null;
     setFlipPos(pos);
     setTimeout(() => setFlipPos(null), 350);
 
@@ -1213,6 +1343,7 @@ export default function App() {
     setMessageType('success');
     setCurrentIdx(nextIdx);
     setTurnEndsAt(newTurnEndsAt);
+    if (modeRef.current === 'online') knownCurrentPlayerIdRef.current = newPlayers[nextIdx].id;
 
     if (modeRef.current === 'online') {
       const code = sessionCodeRef.current;
@@ -1258,6 +1389,55 @@ export default function App() {
     }
   }
 
+  // Host-only: freeze/unfreeze the game for everyone (e.g. a bathroom break).
+  // Captures whichever countdown is currently running so nobody loses time.
+  async function togglePause() {
+    const code = sessionCodeRef.current;
+    const cp = playersRef.current;
+    const nextPaused = !paused;
+    setPaused(nextPaused);
+    knownPausedRef.current = nextPaused;
+    const remaining = pendingMove ? objectionTimeLeft : timeLeft;
+    const type = pendingMove ? 'objection' : 'turn';
+    await writeSession(code, buildSessionPayload({
+      players: rosterOf(cp), hands: handsOf(cp), bag, tableWord, tableStarFlags,
+      currentPlayerId: cp[currentIdxRef.current] ? cp[currentIdxRef.current].id : cp[0].id,
+      turnEndsAt, pendingMove,
+      paused: nextPaused,
+      pausedRemaining: nextPaused ? remaining : null,
+      pausedType: nextPaused ? type : null,
+      lastMessage: nextPaused ? '⏸️ أوقف المضيف اللعبة مؤقتًا' : '▶️ استُؤنفت اللعبة',
+      lastMessageType: 'info',
+    }));
+  }
+
+  // Leave the current session and go back to the menu. If the game hasn't
+  // started yet, also remove ourselves from the waiting room so the host
+  // sees an accurate player count.
+  async function leaveSession() {
+    if (!window.confirm('متأكد إنك تبي تطلع من الجلسة؟')) return;
+    const code = sessionCodeRef.current;
+    try {
+      const session = code ? await readSession(code) : null;
+      if (session && session.status === 'waiting') {
+        const updated = { ...session, players: session.players.filter((p) => p.id !== myIdRef.current) };
+        await writeSession(code, updated);
+      }
+    } catch (e) { /* best effort */ }
+    goMenu();
+  }
+
+  // Host-only: start a fresh round with the exact same roster - no need to
+  // re-share the code or re-gather everyone.
+  async function rematchSession() {
+    const code = sessionCodeRef.current;
+    const session = await readSession(code);
+    if (!session) return;
+    const full = dealAndStart(code, session);
+    await writeSession(code, full);
+    applySessionToLocal(full);
+  }
+
   // Pre-game toggle (host-setup screen) - just local state, no bag exists yet.
   function toggleSetupExclude(letter) {
     setExcludedLetters((prev) => {
@@ -1299,7 +1479,7 @@ export default function App() {
   }
 
   function handleHandClick(idx) {
-    if (currentIdx !== myIndex || pendingMove || prepTimeLeft > 0) return;
+    if (currentIdx !== myIndex || pendingMove || prepTimeLeft > 0 || paused) return;
     setStarPicker(null);
     setSelectedHand(idx === selectedHand ? null : idx);
     if (idx !== selectedHand) {
@@ -1310,7 +1490,7 @@ export default function App() {
   }
 
   function handleTableClick(pos) {
-    if (currentIdx !== myIndex || pendingMove || prepTimeLeft > 0) return;
+    if (currentIdx !== myIndex || pendingMove || prepTimeLeft > 0 || paused) return;
     if (selectedHand === null) {
       setMessage('اختر أولًا حرفًا من يدك');
       setMessageType('error');
@@ -1347,11 +1527,13 @@ export default function App() {
     // with the host as tie-breaker if someone objects.
     if (modeRef.current === 'online' && communityModeRef.current) {
       const pending = {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         moverIndex: myIndex, pos, letter, isStar, candidateWord,
         deadline: Date.now() + objectionSecondsRef.current * 1000,
         disputed: false,
       };
       setPendingMove(pending);
+      knownPendingIdRef.current = pending.id;
       setSelectedHand(null);
       setMessage(`🗳️ "${candidateWord}" — ${objectionSecondsRef.current} ث للاعتراض وإلا تُقبل تلقائيًا`);
       setMessageType('info');
@@ -1377,6 +1559,12 @@ export default function App() {
   }
 
   function goMenu() {
+    try { window.localStorage.removeItem('faseeh_current_session'); } catch (e) { /* best effort */ }
+    knownDealIdRef.current = null;
+    knownCurrentPlayerIdRef.current = null;
+    knownPendingIdRef.current = null;
+    knownPausedRef.current = false;
+    setPaused(false);
     setScreen('menu');
     setMode(null);
     setSessionCode('');
@@ -1873,7 +2061,9 @@ export default function App() {
     return (
       <div dir="rtl" style={{ ...cairo, ...woodBgStyle, ...safeAreaCentered }} className="min-h-screen flex items-center justify-center">
         <div className="max-w-md sm:max-w-lg w-full text-center">
-          <BackButton onClick={goMenu} />
+          <button onClick={leaveSession} className="flex items-center gap-1.5 text-amber-200/70 hover:text-amber-100 text-sm font-bold mb-4 transition-colors">
+            <ArrowRight size={16} /> مغادرة والرجوع للقائمة
+          </button>
           <div style={woodPanelStyle} className="rounded-2xl p-8 border-4 border-amber-950">
             <Loader2 size={40} className="mx-auto text-emerald-300 animate-spin mb-4" />
             <p className="text-amber-100 font-bold mb-4">{searchMsg}</p>
@@ -1929,9 +2119,24 @@ export default function App() {
           <Trophy size={64} className="mx-auto text-amber-300 mb-4" />
           <h2 className="text-3xl font-black text-amber-100 mb-2">🎉 مبروك!</h2>
           <p className="text-xl text-emerald-300 font-bold mb-8">{winnerName} فاز باللعبة</p>
-          <button onClick={goMenu} className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-3 rounded-xl transition-colors shadow-lg border-2 border-emerald-800">
-            <RotateCcw size={18} /> القائمة الرئيسية
-          </button>
+          <div className="flex flex-col items-center gap-3">
+            {mode === 'bot' && (
+              <button onClick={startBotGame} className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-3 rounded-xl transition-colors shadow-lg border-2 border-emerald-800">
+                <RotateCcw size={18} /> العب مرة أخرى
+              </button>
+            )}
+            {mode === 'online' && amHost && (
+              <button onClick={rematchSession} className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-3 rounded-xl transition-colors shadow-lg border-2 border-emerald-800">
+                <RotateCcw size={18} /> جولة جديدة بنفس الأصدقاء
+              </button>
+            )}
+            {mode === 'online' && !amHost && (
+              <p className="text-amber-200/50 text-xs">المضيف يقدر يبدأ جولة جديدة بنفس اللاعبين</p>
+            )}
+            <button onClick={goMenu} className="inline-flex items-center gap-2 bg-stone-700 hover:bg-stone-600 text-white font-bold px-6 py-3 rounded-xl transition-colors shadow-lg border-2 border-stone-900">
+              <ArrowRight size={18} /> القائمة الرئيسية
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -1974,7 +2179,45 @@ export default function App() {
         })}
       </div>
 
-      {prepTimeLeft > 0 ? (
+      {mode === 'online' && (
+        <div className="flex items-center justify-center gap-4 mb-2">
+          <button
+            onClick={leaveSession}
+            className="flex items-center gap-1.5 text-amber-200/60 hover:text-rose-300 text-xs font-bold"
+          >
+            <ArrowRight size={14} /> مغادرة
+          </button>
+          {amHost && (
+            <button
+              onClick={togglePause}
+              className="flex items-center gap-1.5 text-amber-200/60 hover:text-amber-100 text-xs font-bold"
+            >
+              {paused ? <><PlayCircle size={14} /> استئناف</> : <><PauseCircle size={14} /> إيقاف مؤقت</>}
+            </button>
+          )}
+        </div>
+      )}
+
+      {mode === 'online' && communityMode && (
+        <div className="flex justify-center mb-2">
+          <span className="flex items-center gap-1.5 text-[11px] font-bold text-amber-200 bg-amber-950/50 border border-amber-700 rounded-full px-3 py-1">
+            <Gavel size={12} /> وضع حكم اللاعبين مفعّل — كل كلمة قابلة للاعتراض
+          </span>
+        </div>
+      )}
+
+      {myTurn && !paused && prepTimeLeft === 0 && !pendingMove && (
+        <div className="mb-3 text-center rounded-2xl py-2 px-4 bg-emerald-600 border-2 border-emerald-300 animate-pulse shadow-lg">
+          <p className="text-white font-black text-lg">🔔 دورك الآن يا {me.name}!</p>
+        </div>
+      )}
+
+      {paused ? (
+        <div className="flex items-center justify-center gap-2 mb-2">
+          <PauseCircle size={18} className="text-amber-300" />
+          <span className="text-amber-200 text-sm font-bold">اللعبة متوقفة مؤقتًا{amHost ? '' : ' من المضيف'}</span>
+        </div>
+      ) : prepTimeLeft > 0 ? (
         <div className="flex items-center justify-center gap-2 mb-2">
           <span className="text-amber-200 text-sm font-bold">
             استعد! تبدأ المباراة خلال <span className="text-emerald-300 text-xl tabular-nums">{prepTimeLeft}</span> ثانية
@@ -2021,7 +2264,7 @@ export default function App() {
                 <button
                   key={pos}
                   onClick={() => handleTableClick(pos)}
-                  disabled={!myTurn || !!pendingMove || prepTimeLeft > 0}
+                  disabled={!myTurn || !!pendingMove || prepTimeLeft > 0 || paused}
                   className={`relative w-14 h-14 sm:w-20 sm:h-20 rounded-xl bg-amber-100 border-2 border-amber-800 text-stone-900 font-black text-2xl sm:text-4xl shadow-lg transition-all hover:scale-105 hover:border-emerald-500 disabled:opacity-70 ${
                     flipPos === pos ? 'scale-125 bg-emerald-200' : ''
                   } ${selectedHand !== null ? 'ring-2 ring-emerald-500 ring-offset-2 ring-offset-emerald-900' : ''}`}
@@ -2122,7 +2365,7 @@ export default function App() {
             <button
               key={idx}
               onClick={() => handleHandClick(idx)}
-              disabled={!myTurn || !!pendingMove || prepTimeLeft > 0}
+              disabled={!myTurn || !!pendingMove || prepTimeLeft > 0 || paused}
               className={`w-11 h-11 sm:w-14 sm:h-14 rounded-lg font-black text-xl sm:text-2xl border-2 transition-all disabled:opacity-60 ${
                 selectedHand === idx
                   ? 'bg-emerald-500 border-emerald-300 text-white scale-110'
