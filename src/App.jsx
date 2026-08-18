@@ -867,13 +867,17 @@ export default function App() {
 
     if (session.pendingMove) {
       const pmId = session.pendingMove.id;
+      // Use the stored deadline from the session so all clients share the same
+      // objection window. Only set it once per pending-move id to avoid resetting
+      // the countdown every time the guest polls.
+      const storedDeadline = session.pendingMove.deadline || Date.now() + (session.objectionSeconds || 5) * 1000;
       if (pmId !== knownPendingIdRef.current) {
         knownPendingIdRef.current = pmId;
-        setPendingMove({ ...session.pendingMove, deadline: Date.now() + (session.objectionSeconds || 5) * 1000 });
+        setPendingMove({ ...session.pendingMove, deadline: storedDeadline });
       } else {
         // Same pending move as before (e.g. someone just disputed it) - keep
-        // our own already-anchored deadline, just refresh the other fields.
-        setPendingMove((prev) => (prev ? { ...session.pendingMove, deadline: prev.deadline } : { ...session.pendingMove, deadline: Date.now() + (session.objectionSeconds || 5) * 1000 }));
+        // our already-anchored deadline, just refresh the other fields.
+        setPendingMove((prev) => (prev ? { ...session.pendingMove, deadline: prev.deadline } : { ...session.pendingMove, deadline: storedDeadline }));
       }
     } else {
       knownPendingIdRef.current = null;
