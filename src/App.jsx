@@ -883,13 +883,18 @@ export default function App() {
     if (session.paused && !knownPausedRef.current) {
       // just paused - ticking effects freeze on their own via the `paused` flag
     } else if (!session.paused && knownPausedRef.current) {
-      // just resumed - reanchor from the remaining time using OUR clock
-      const remaining = session.pausedRemaining || sTurnSeconds;
-      if (session.pausedType === 'objection') {
-        setPendingMove((prev) => (prev ? { ...prev, deadline: Date.now() + remaining * 1000 } : prev));
-      } else {
-        setTurnEndsAt(Date.now() + remaining * 1000);
+      // just resumed - reanchor from the remaining time using OUR clock,
+      // but only if pausedRemaining is a valid number (not null/undefined).
+      // This prevents clobbering turnEndsAt written by the host's accept/reject.
+      const remaining = typeof session.pausedRemaining === 'number' ? session.pausedRemaining : null;
+      if (remaining !== null) {
+        if (session.pausedType === 'objection') {
+          setPendingMove((prev) => (prev ? { ...prev, deadline: Date.now() + remaining * 1000 } : prev));
+        } else {
+          setTurnEndsAt(Date.now() + remaining * 1000);
+        }
       }
+      // If pausedRemaining is null, trust the session's turnEndsAt as-is
     }
     knownPausedRef.current = !!session.paused;
     setPaused(!!session.paused);
@@ -1171,12 +1176,26 @@ export default function App() {
     return () => clearInterval(t);
   }, [screen, pendingMove, paused]);
 
-  // ---- auto-accept once the objection window passes with no objection (mover's own client confirms) ----
+  // ---- auto-accept once the objection window passes with no objection (HOST's client confirms) ----
   useEffect(() => {
     if (screen !== 'playing' || !pendingMove || pendingMove.disputed || paused) return;
     if (objectionTimeLeft > 0) return;
-    if (pendingMove.moverIndex !== myIndexRef.current) return;
-    resolvePendingMove('accept');
+    // Only the HOST can auto-accept — guests wait for the host's decision
+    if (!amHostRef.current) return;
+    // Pre-verify: read the session to make sure disputed wasn't set between
+    // our last poll and the timer hitting zero (race-condition guard).
+    (async () => {
+      try {
+        const code = sessionCodeRef.current;
+        if (!code) return;
+        const session = await readSession(code);
+        if (session?.pendingMove?.id === pendingMove.id && !session.pendingMove.disputed) {
+          resolvePendingMove('accept');
+        }
+        // If disputed was set in the meantime, do nothing — the host will
+        // see the dispute UI and decide manually.
+      } catch { /* storage error — skip auto-accept, host can decide manually */ }
+    })();
   }, [objectionTimeLeft, pendingMove, screen, paused]);
 
   // ---- bot AI turn ----
@@ -1291,6 +1310,7 @@ export default function App() {
         hands: handsOf(newPlayers),
         bag: newBag, tableWord, tableStarFlags, currentPlayerId: newPlayers[nextIdx].id,
         turnEndsAt: newTurnEndsAt, lastMessage: msg, lastMessageType: 'error',
+        paused: false, pausedType: null, pausedRemaining: null,
       }));
     }
   }
@@ -1333,6 +1353,7 @@ export default function App() {
           bag, tableWord: candidate, tableStarFlags: newStarFlags, currentPlayerId: newPlayers[moverIndex].id,
           turnEndsAt, lastMessage: `✅ "${candidateWord}" — ${mover.name} فاز!`, lastMessageType: 'success',
           winnerId: newPlayers[moverIndex].id,
+          paused: false, pausedType: null, pausedRemaining: null,
         }));
       }
       setScreen('finished');
@@ -1357,6 +1378,7 @@ export default function App() {
         hands: handsOf(newPlayers),
         bag, tableWord: candidate, tableStarFlags: newStarFlags, currentPlayerId: newPlayers[nextIdx].id,
         turnEndsAt: newTurnEndsAt, lastMessage: msg, lastMessageType: 'success',
+        paused: false, pausedType: null, pausedRemaining: null,
       }));
     }
   }
@@ -1365,6 +1387,10 @@ export default function App() {
   function resolvePendingMove(decision) {
     const pm = pendingMoveRef.current;
     if (!pm) return;
+    // In online community mode, only the host may resolve pending moves.
+    // This prevents any guest client from accidentally (or intentionally)
+    // calling resolvePendingMove, which would bypass the host's authority.
+    if (modeRef.current === 'online' && communityModeRef.current && !amHostRef.current) return;
     if (decision === 'accept') {
       trackAcceptedCommunityWord(pm.candidateWord);
       applyAcceptedMove(pm.moverIndex, pm.pos, pm.letter, pm.isStar, pm.candidateWord);
@@ -1382,6 +1408,10 @@ export default function App() {
     if (modeRef.current === 'online') {
       const code = sessionCodeRef.current;
       const cp = playersRef.current;
+      // Pause the session immediately so all timers freeze while the host decides.
+      // This ensures the game is truly "stopped" during the dispute.
+      setPaused(true);
+      knownPausedRef.current = true;
       writeSession(code, buildSessionPayload({
         players: rosterOf(cp),
         hands: handsOf(cp),
@@ -1390,6 +1420,9 @@ export default function App() {
         lastMessage: `⚠️ تم الاعتراض على "${pm.candidateWord}" — بانتظار قرار المضيف`,
         lastMessageType: 'error',
         pendingMove: updated,
+        paused: true,
+        pausedType: 'objection',
+        pausedRemaining: objectionTimeLeft,
       }));
     }
   }
