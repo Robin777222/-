@@ -1391,13 +1391,18 @@ export default function App() {
   function resolvePendingMove(decision) {
     const pm = pendingMoveRef.current;
     if (!pm) return;
-    // In online community mode, only the host may resolve pending moves.
+    // In online mode, only the host may resolve pending moves.
     // This prevents any guest client from accidentally (or intentionally)
     // calling resolvePendingMove, which would bypass the host's authority.
-    if (modeRef.current === 'online' && communityModeRef.current && !amHostRef.current) return;
+    if (modeRef.current === 'online' && !amHostRef.current) return;
     if (decision === 'accept') {
-      trackAcceptedCommunityWord(pm.candidateWord);
-      applyAcceptedMove(pm.moverIndex, pm.pos, pm.letter, pm.isStar, pm.candidateWord);
+      // In non-community mode, validate the word against the dictionary before accepting
+      if (!communityModeRef.current && pm.valid === false) {
+        applyPenaltyAndAdvance(`"${pm.candidateWord}" ليست كلمة صحيحة`);
+      } else {
+        trackAcceptedCommunityWord(pm.candidateWord);
+        applyAcceptedMove(pm.moverIndex, pm.pos, pm.letter, pm.isStar, pm.candidateWord);
+      }
     } else {
       applyPenaltyAndAdvance(`"${pm.candidateWord}" اعتُرض عليها ورفضها المضيف`);
     }
@@ -1600,14 +1605,15 @@ export default function App() {
     candidate[pos] = letter;
     const candidateWord = candidate.join('');
 
-    // Community/party mode: skip the dictionary and let the table decide,
-    // with the host as tie-breaker if someone objects.
-    if (modeRef.current === 'online' && communityModeRef.current) {
+    // Online mode: create a pending move with mandatory objection timer
+    if (modeRef.current === 'online') {
+      const isWordValid = communityModeRef.current ? true : checkWord(candidateWord);
       const pending = {
         id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         moverIndex: myIndex, pos, letter, isStar, candidateWord,
         deadline: Date.now() + objectionSecondsRef.current * 1000,
         disputed: false,
+        valid: isWordValid,
       };
       setPendingMove(pending);
       knownPendingIdRef.current = pending.id;
@@ -1626,12 +1632,6 @@ export default function App() {
         pendingMove: pending,
       }));
       return;
-    }
-
-    if (checkWord(candidateWord)) {
-      applyAcceptedMove(myIndex, pos, letter, isStar, candidateWord);
-    } else {
-      applyPenaltyAndAdvance(`"${candidateWord}" ليست كلمة صحيحة`);
     }
   }
 
@@ -2043,25 +2043,23 @@ export default function App() {
                 </span>
               </button>
               <p className="text-amber-200/50 text-xs leading-relaxed">
-                كل كلمة تُقبل مباشرة، وأي لاعب بالجلسة يقدر يعترض عليها — وإذا صار اعتراض، أنت (المضيف) تقرر تقبلها أو ترفضها.
+                كل كلمة تُرسل بعد مهلة انتظار — وأي لاعب بالجلسة يقدر يعترض عليها خلال المهلة.
               </p>
-              {communityMode && (
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-amber-50 font-bold text-xs">مهلة الاعتراض</span>
-                    <span className="text-emerald-300 font-bold text-xs">{objectionSeconds} ثانية</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={2}
-                    max={30}
-                    step={1}
-                    value={objectionSeconds}
-                    onChange={(e) => setObjectionSeconds(Number(e.target.value))}
-                    className="w-full accent-emerald-500"
-                  />
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-amber-50 font-bold text-xs">مهلة الاعتراض</span>
+                  <span className="text-emerald-300 font-bold text-xs">{objectionSeconds} ثانية</span>
                 </div>
-              )}
+                <input
+                  type="range"
+                  min={2}
+                  max={30}
+                  step={1}
+                  value={objectionSeconds}
+                  onChange={(e) => setObjectionSeconds(Number(e.target.value))}
+                  className="w-full accent-emerald-500"
+                />
+              </div>
             </div>
 
             <div style={woodPanelDarkStyle} className="rounded-xl p-4 border-2 border-amber-950">
@@ -2275,10 +2273,10 @@ export default function App() {
         </div>
       )}
 
-      {mode === 'online' && communityMode && (
+      {mode === 'online' && (
         <div className="flex justify-center mb-2">
           <span className="flex items-center gap-1.5 text-[11px] font-bold text-amber-200 bg-amber-950/50 border border-amber-700 rounded-full px-3 py-1">
-            <Gavel size={12} /> وضع حكم اللاعبين مفعّل — كل كلمة قابلة للاعتراض
+            <Gavel size={12} /> مهلة الاعتراض مفعّل ({objectionSeconds} ث) — الانتظار قبل قبول الكلمة
           </span>
         </div>
       )}
