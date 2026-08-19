@@ -420,6 +420,7 @@ export default function App() {
   const knownDealIdRef = useRef(null);
   const knownCurrentPlayerIdRef = useRef(null);
   const knownPendingIdRef = useRef(null);
+  const locallyPendingMoveRef = useRef(null); // tracks pending moves set locally before session write completes
   const knownPausedRef = useRef(false);
 
   const [screen, setScreen] = useState('menu');
@@ -867,6 +868,8 @@ export default function App() {
 
     if (session.pendingMove) {
       const pmId = session.pendingMove.id;
+      // Session confirms the pending move exists – clear the local flag.
+      locallyPendingMoveRef.current = null;
       // Use the stored deadline from the session so all clients share the same
       // objection window. Only set it once per pending-move id to avoid resetting
       // the countdown every time the guest polls.
@@ -880,8 +883,14 @@ export default function App() {
         setPendingMove((prev) => (prev ? { ...session.pendingMove, deadline: prev.deadline } : { ...session.pendingMove, deadline: storedDeadline }));
       }
     } else {
-      knownPendingIdRef.current = null;
-      setPendingMove(null);
+      // Only clear pendingMove if it wasn't set locally in this client.
+      // When a player makes a move, the session write is async; the next poll
+      // may read stale data (no pendingMove yet). Clearing it here would let
+      // the turn-timeout effect fire prematurely (the real bug).
+      if (!locallyPendingMoveRef.current) {
+        knownPendingIdRef.current = null;
+        setPendingMove(null);
+      }
     }
 
     if (session.paused && !knownPausedRef.current) {
@@ -1297,6 +1306,7 @@ export default function App() {
     setBag(newBag);
     setSelectedHand(null);
     setPendingMove(null);
+    locallyPendingMoveRef.current = null;
     setMessage(msg);
     setMessageType('error');
     setCurrentIdx(nextIdx);
@@ -1339,7 +1349,10 @@ export default function App() {
 
     setSelectedHand(null);
     setPendingMove(null);
-    if (modeRef.current === 'online') knownPendingIdRef.current = null;
+    if (modeRef.current === 'online') {
+      knownPendingIdRef.current = null;
+      locallyPendingMoveRef.current = null;
+    }
     setFlipPos(pos);
     setTimeout(() => setFlipPos(null), 350);
 
@@ -1617,6 +1630,7 @@ export default function App() {
       };
       setPendingMove(pending);
       knownPendingIdRef.current = pending.id;
+      locallyPendingMoveRef.current = pending.id;
       setSelectedHand(null);
       setMessage(`🗳️ "${candidateWord}" — ${objectionSecondsRef.current} ث للاعتراض وإلا تُقبل تلقائيًا`);
       setMessageType('info');
@@ -1640,6 +1654,7 @@ export default function App() {
     knownDealIdRef.current = null;
     knownCurrentPlayerIdRef.current = null;
     knownPendingIdRef.current = null;
+    locallyPendingMoveRef.current = null;
     knownPausedRef.current = false;
     setPaused(false);
     setScreen('menu');
